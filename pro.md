@@ -1,137 +1,108 @@
 Notification System
 
-A simple asynchronous notification system built with Node.js, Express, Redis, RabbitMQ, and MongoDB.
+An asynchronous notification system built with Node.js, Express.js, Redis, RabbitMQ, and MongoDB.
 
-The main idea is to keep the API fast by moving notification processing to a background worker.
+The main goal is to process notifications in the background instead of making the API wait for the complete notification process.
 
----
+Workflow
 
-System Workflow
-
-flowchart LR
-
-    C[Client] -->|Notification Request| A[API Service]
-
-    A -->|Rate Limit| R[(Redis)]
-    R -->|Check Duplicate| R
-
-    R -->|Request Valid| Q[RabbitMQ]
-
-    Q -->|Consume Job| W[Worker Service]
-
-    W -->|Send Email| E[Email Service]
-
-    E -->|Success| M[(MongoDB)]
-
-    E -->|Failure| W
-
-    W -->|Retry ≤ 3| Q
-
-    W -->|Retry > 3| F[(MongoDB - FAILED)]
-
-    M --> C
-    F --> C
-
-    classDef client fill:#111827,stroke:#60a5fa,color:#fff
-    classDef service fill:#172554,stroke:#38bdf8,color:#fff
-    classDef queue fill:#3f1d0b,stroke:#fb923c,color:#fff
-    classDef database fill:#052e16,stroke:#4ade80,color:#fff
-    classDef email fill:#312e81,stroke:#a78bfa,color:#fff
-
-    class C client
-    class A,W service
-    class Q queue
-    class R,M,F database
-    class E email
-
-«Flow: Client → API → Redis → RabbitMQ → Worker → Email → MongoDB»
-
-If notification delivery fails, the worker sends the job back to RabbitMQ for retry.
-
----
-
-How the System Works
-
-1. Client Sends Request
-
-The client sends a notification request to the API.
+<p align="center">
+  <img src="./workflow.gif" alt="Notification System Workflow" width="100%">
+</p>System Flow
 
 Client
-  ↓
-API
-
-The API is responsible for accepting the request and preparing it for background processing.
-
----
-
-2. Redis Checks the Request
-
-Before creating a job, the API uses Redis for two checks:
-
-- Rate limiting
-- Duplicate message detection
-
-The current rate limit is 5 requests per minute per user.
-
-Duplicate messages are also blocked for a short period.
-
-API
- ↓
+   │
+   ▼
+ API
+   │
+   ▼
 Redis
- ├── Rate Limit
- └── Deduplication
-
----
-
-3. RabbitMQ Creates the Queue
-
-If the Redis checks pass, the API publishes the notification job to RabbitMQ.
-
-The API does not wait for the email to be sent.
-
-API
- ↓
+   │
+   ▼
 RabbitMQ
- ↓
-Notification Queue
-
-This makes the API faster and separates request handling from notification processing.
-
----
-
-4. Worker Processes the Job
-
-The worker continuously listens to the "notifications" queue.
-
-When a message arrives, the worker consumes it and tries to send the notification.
-
-RabbitMQ
-    ↓
-  Worker
-    ↓
- Send Email
-
-The worker receives information such as:
-
-- "userId"
-- "email"
-- "message"
-- "retry"
-
----
+   │
+   ▼
+Worker
+   │
+   ▼
+Email Service
+   │
+   ▼
+MongoDB
 
 Retry Flow
 
-If notification delivery fails, the worker increases the retry count.
+Worker
+   │
+   ├── Success ──────────────► MongoDB
+   │
+   └── Failure
+          │
+          ▼
+      RabbitMQ
+          │
+          ▼
+        Worker
+          │
+          └── Retry up to 3 times
+
+---
+
+How It Works
+
+1. Client → API
+
+The client sends a notification request to the API.
+
+The API receives the request and prepares it for background processing.
+
+2. API → Redis
+
+Redis performs two checks before the job is created:
+
+- Rate limiting — limits requests to 5 per minute.
+- Deduplication — prevents duplicate notification requests.
+
+If the request passes these checks, it continues to RabbitMQ.
+
+3. Redis → RabbitMQ
+
+The API publishes the notification job to the RabbitMQ "notifications" queue.
+
+The API does not wait for the notification to be delivered.
+
+This keeps the API response fast.
+
+4. RabbitMQ → Worker
+
+The worker continuously listens to the notification queue.
+
+When a job arrives, the worker consumes it and tries to send the notification.
+
+5. Worker → MongoDB
+
+If the notification is successfully sent:
 
 Worker
-  ↓
-Failed
-  ↓
-Retry?
-  ↓
+   ↓
+Success
+   ↓
+MongoDB
+   ↓
+SUCCESS
+
+The RabbitMQ message is then acknowledged.
+
+6. Failure & Retry
+
+If notification delivery fails, the worker increases the retry count and sends the job back to RabbitMQ.
+
+Worker
+   ↓
+Failure
+   ↓
 RabbitMQ
-  ↓
+   ↓
 Worker
 
 The job can be retried up to 3 times.
@@ -139,72 +110,55 @@ The job can be retried up to 3 times.
 If all retries fail:
 
 Worker
-  ↓
-Failed after retries
-  ↓
+   ↓
+Retry limit reached
+   ↓
 MongoDB
-  ↓
+   ↓
 FAILED
 
-This prevents failed jobs from staying in an endless processing loop.
-
 ---
 
-Success Flow
-
-When the notification is successfully delivered:
-
-Worker
-  ↓
-Email Sent
-  ↓
-MongoDB
-  ↓
-SUCCESS
-  ↓
-RabbitMQ ACK
-
-The message is acknowledged and removed from the queue.
-
----
-
-Components
+Architecture
 
 Component| Responsibility
 Client| Sends notification requests
-API| Accepts requests and creates jobs
+API| Receives requests and creates jobs
 Redis| Rate limiting and deduplication
-RabbitMQ| Stores and delivers background jobs
+RabbitMQ| Message queue and retry handling
 Worker| Processes notification jobs
-Email Service| Sends the notification
-MongoDB| Stores delivery results
+Email Service| Sends notifications
+MongoDB| Stores notification results
 
 ---
 
 Why This Architecture?
 
-The system separates request handling from notification processing.
+The system separates API request handling from notification processing.
 
-Instead of making the client wait for the notification to finish:
+Instead of:
 
-Client
-  ↓
-API
-  ↓
-Queue
-  ↓
-Worker
+Client → API → Send Email → Response
 
-The API can return quickly while the worker processes the job in the background.
+the system uses:
 
-This approach also makes it easier to handle:
+Client → API → RabbitMQ
+                 ↓
+               Worker
+                 ↓
+              Send Email
 
-- High request traffic
-- Temporary failures
-- Retries
-- Duplicate requests
-- Background processing
-- Delivery tracking
+This allows the API to respond quickly while the worker processes the notification in the background.
+
+Benefits
+
+- Asynchronous processing
+- Faster API response
+- Retry handling
+- Duplicate protection
+- Rate limiting
+- Background workers
+- Notification status tracking
 
 ---
 
@@ -228,40 +182,14 @@ notification-system/
 ├── worker/
 │   └── Worker Service
 │
+├── workflow.gif
+│
 └── README.md
 
 ---
 
-Core Flow
+Core Idea
 
-Client
-  │
-  ▼
-API
-  │
-  ▼
-Redis
-  │
-  ├── Rate Limit
-  └── Deduplication
-  │
-  ▼
-RabbitMQ
-  │
-  ▼
-Worker
-  │
-  ├── Success ───────► MongoDB
-  │
-  └── Failure
-          │
-          ▼
-      Retry Queue
-          │
-          └──────────► Worker
+«The API accepts the request, Redis validates it, RabbitMQ queues it, the worker processes it, and MongoDB stores the result.»
 
-In short
-
-API handles the request. Redis validates it. RabbitMQ stores the job. Worker processes it. MongoDB records the result.
-
-The important part of this architecture is the queue + worker + retry loop, which allows notification processing to happen asynchronously.
+The queue and worker architecture keeps notification processing asynchronous and provides a simple retry mechanism for failed jobs.
